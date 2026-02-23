@@ -1,74 +1,92 @@
 import re
 import time
-import os
-import hashlib
 import requests
-from dotenv import load_dotenv
+import random
+import string
 from playwright.sync_api import sync_playwright
 from playwright_stealth import stealth_sync
 
-load_dotenv()
+# --- Cấu hình Mail.tm API ---
+API_URL = "https://api.mail.tm"
 
-# Cấu hình API Temp-Mail (Sử dụng RapidAPI)
-RAPID_API_KEY = os.getenv("RAPID_API_KEY")
-API_HOST = "privatix-temp-mail-v1.p.rapidapi.com"
-
-def get_email_hash(email):
-    return hashlib.md5(email.encode()).hexdigest()
-
-def fetch_otp(email_hash):
-    url = f"https://{API_HOST}/request/mail/id/{email_hash}/"
-    headers = {"X-RapidAPI-Key": RAPID_API_KEY, "X-RapidAPI-Host": API_HOST}
+def get_mail_tm():
+    # 1. Lấy danh sách domain
+    domains = requests.get(f"{API_URL}/domains").json()['hydra:member']
+    domain = domains[0]['domain']
     
-    print("... Đang kiểm tra hòm thư ...")
-    for _ in range(15):  # Thử lại trong 75 giây
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            data = response.json()
-            if data and len(data) > 0:
-                content = data[0].get('mail_text', '') or data[0].get('mail_html', '')
-                match = re.search(r'\b\d{6}\b', content)
-                if match:
-                    return match.group(0)
+    # 2. Tạo username và password ngẫu nhiên
+    username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+    address = f"{username}@{domain}"
+    password = "Password123!"
+    
+    # 3. Tạo tài khoản
+    payload = {"address": address, "password": password}
+    requests.post(f"{API_URL}/accounts", json=payload)
+    
+    # 4. Lấy Token để truy cập mail
+    token_resp = requests.post(f"{API_URL}/token", json=payload).json()
+    token = token_resp['token']
+    
+    return address, token
+
+def wait_for_otp(token):
+    headers = {"Authorization": f"Bearer {token}"}
+    print("--- Đang chờ mã OTP từ InVideo ---")
+    
+    for _ in range(20): # Đợi trong khoảng 100 giây
         time.sleep(5)
+        # Lấy danh sách tin nhắn
+        msgs = requests.get(f"{API_URL}/messages", headers=headers).json()['hydra:member']
+        
+        if msgs:
+            msg_id = msgs[0]['id']
+            # Đọc nội dung tin nhắn mới nhất
+            msg_data = requests.get(f"{API_URL}/messages/{msg_id}", headers=headers).json()
+            content = msg_data['text'] # Hoặc 'html'
+            
+            # Tìm mã 6 số
+            match = re.search(r'\b\d{6}\b', content)
+            if match:
+                return match.group(0)
     return None
 
-def register():
-    # Lấy email ngẫu nhiên từ API
-    headers = {"X-RapidAPI-Key": RAPID_API_KEY, "X-RapidAPI-Host": API_HOST}
-    email_resp = requests.get(f"https://{API_HOST}/request/domains/", headers=headers)
-    email = f"user_{int(time.time())}{email_resp.json()[0]}"
-    e_hash = get_email_hash(email)
-
+def run_reg():
+    email, token = get_mail_tm()
+    
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True) # Chạy ẩn
-        context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        # Khởi tạo trình duyệt ẩn
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
         page = context.new_page()
-        stealth_sync(page) # Chế độ ẩn danh bot
+        stealth_sync(page) # Che dấu vết bot
 
-        print(f"Bắt đầu đăng ký với: {email}")
-        page.goto("https://ai.invideo.io/signup") # Link gốc hoặc link videoinu
-
-        # Logic điền form (Tùy biến theo Selector của web)
-        page.fill('input[type="email"]', email)
-        page.click('button[type="submit"]') 
+        print(f"Đang sử dụng email: {email}")
         
-        print("Đang đợi mã OTP từ Temp-Mail...")
-        otp = fetch_otp(e_hash)
+        # Truy cập trang đăng ký của InVideo AI
+        page.goto("https://ai.invideo.io/signup")
 
-        if otp:
-            print(f"Tìm thấy mã OTP: {otp}")
-            # Điền mã OTP vào ô nhập (VD: các ô input code)
-            # page.fill('input#otp-input', otp)
-            # page.click('button#verify')
-            print("Đăng ký hoàn tất!")
-        else:
-            print("Không nhận được mã OTP. Thử lại sau.")
-        
+        try:
+            # Nhập email vào ô input
+            page.wait_for_selector('input[type="email"]')
+            page.fill('input[type="email"]', email)
+            page.keyboard.press("Enter")
+            
+            print("Đã nhấn đăng ký, đang kiểm tra hòm thư...")
+            otp = wait_for_otp(token)
+            
+            if otp:
+                print(f"MÃ OTP CỦA BẠN LÀ: {otp}")
+                # Ở đây bạn có thể viết thêm code để tự điền otp vào page
+                # page.fill('input[name="otp"]', otp)
+            else:
+                print("Hết thời gian chờ mà không thấy mã.")
+        except Exception as e:
+            print(f"Lỗi: {e}")
+            page.screenshot(path="error_log.png")
+            
         browser.close()
 
 if __name__ == "__main__":
-    if not RAPID_API_KEY:
-        print("Vui lòng cấu hình RAPID_API_KEY trong file .env")
-    else:
-        register()
+    run_reg()
